@@ -8,8 +8,12 @@ use base qw(Slim::Plugin::OPMLBased);
 use Digest::MD5 qw(md5_hex);
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
+use Promise::ES6;
 use Plugins::Pyrrha::Pandora qw(getStationList getStationArtUrl addFeedback getStationDetail);
 use Plugins::Pyrrha::Utils qw(trackMetadataForStreamUrl);
+
+# for curation
+use Slim::Menu::TrackInfo;
 
 sub getDisplayName () {
   return 'PLUGIN_PYRRHA_MODULE_NAME';
@@ -105,7 +109,7 @@ sub _makeStationItem {
 
 sub handleFeed {
   my ($client, $callback, $args) = @_;
-  my $query = $args->{'params'}->{'menu'};
+  my $query = $args->{'params'}->{'menu'} || 'pyrrha';
 
   my $items = [];
   my %opml = (
@@ -213,6 +217,13 @@ sub handleFeed {
 sub initPlugin {
   my $class = shift;
 
+#  Curation
+  Slim::Menu::TrackInfo->registerInfoProvider( pyrrhaFeedback => (
+    after => 'top',
+    func  => \&trackInfoFeedback,
+  ) );
+# /Curation
+
   Slim::Player::ProtocolHandlers->registerHandler(
     pyrrha => 'Plugins::Pyrrha::ProtocolHandler'
   );
@@ -260,45 +271,105 @@ sub _pluginDataFor {
 }
 
 
+# Rates the currently playing track and, on a thumbs-down, skips it if
+# possible. Shared by both the hardware Repeat/Shuffle button path
+# (rateTrack) and the trackinfo context-menu path (_rateFromMenu) so the
+# feedback-submission logic only has to be correct in one place.
+#
+# NOTE: like ProtocolHandler::getMetadataFor, this rates whatever is
+# currently *playing* (via $client->playingSong()), not necessarily the
+# specific track a caller may have had in view (e.g. a queued-but-not-yet-
+# playing trackinfo screen). This is fine in practice since Pyrrha only
+# ever streams the "now playing" track, but is worth keeping in mind if
+# this is ever reused from a context where that might not hold.
+#
+# Returns a promise that resolves with the track's metadata hash on
+# success, or rejects with an error string on failure. Callers are
+# responsible for reporting success/failure back to LMS in whatever way
+# is appropriate for how they were invoked (CLI request vs. OPML menu
+# callback).
+sub _submitFeedback {
+  my ($client, $rating) = @_;
+
+  my $song = $client->playingSong()
+    || return Promise::ES6->reject('not currently playing');
+  my $meta = trackMetadataForStreamUrl($song->streamUrl())
+    || return Promise::ES6->reject('no track metadata available');
+
+  return addFeedback(
+    stationToken => $meta->{'stationId'},
+    trackToken   => $meta->{'trackToken'},
+    isPositive   => $rating,
+  )->then(sub {
+
+    $log->info('feedback: thumbs ' . ($rating ? 'up' : 'down')
+      . ' \'' . ($meta->{'songName'} || '') . '\'');
+
+    # if thumbs down, then skip this track if we can
+    if (!$rating && $meta->{'_canSkip'}) {
+      $client->execute(['playlist', 'jump', '+1']);
+    }
+
+    return $meta;
+  });
+}
+
+
 sub rateTrack {
   my $request = shift;
   my $client = $request->client();
   return unless defined $client;
 
-  my $song = $client->playingSong() || return;
-  my $meta = trackMetadataForStreamUrl($song->streamUrl()) || return;
-
   my $rating = $request->getParam('_rating');
 
-  # we need: stationToken (stationId?) and trackToken to rate
-  addFeedback(
-    stationToken => $meta->{'stationId'},
-    trackToken => $meta->{'trackToken'},
-    isPositive => $rating
-  )->then(sub {
-
-  $log->info('feedback:'
-    . ' thumbs ' . $rating ? 'up' : 'down'
-    . ' \'' . $meta->{'songName'} . '\'');
-
-  # if thumbs down, then skip this track if we can
-  if (!$rating && $meta->{'_canSkip'}) {
-    $client->execute(['playlist', 'jump', '+1']);
-  }
-
-  $request->setStatusDone();
-
+  _submitFeedback($client, $rating)->then(sub {
+    $request->setStatusDone();
   })->catch(sub {
-  my $error = shift;
-
-  $log->error('unable to add feedback: ' . $error);
-
-  # the original pandora plugin did this:
-  $request->setStatusBadParams();
-
+    my $error = shift;
+    $log->error('unable to add feedback: ' . $error);
+    # the original pandora plugin did this:
+    $request->setStatusBadParams();
   });
 }
 
+sub trackInfoFeedback {
+  my ($client, $url) = @_;
+
+  return undef unless $url && $url =~ m{^pyrrha://};
+
+  my $song = $client->playingSong() || return undef;
+  my $meta = trackMetadataForStreamUrl($song->streamUrl()) || return undef;
+  return undef unless $meta->{'allowFeedback'};
+
+  return [
+    { name => $client->string('PLUGIN_PYRRHA_I_LIKE'),
+      url  => \&_rateFromMenu, passthrough => [ 1 ] },
+    { name => $client->string('PLUGIN_PYRRHA_I_DONT_LIKE'),
+      url  => \&_rateFromMenu, passthrough => [ 0 ] },
+  ];
+}
+
+sub _rateFromMenu {
+  my ($client, $callback, $params, $rating) = @_;
+
+  $log->info('_rateFromMenu: submitting thumbs ' . ($rating ? 'up' : 'down'));
+
+  _submitFeedback($client, $rating)->then(sub {
+
+    $log->info('_rateFromMenu: feedback accepted');
+
+    $callback->({ items => [{
+      name        => $rating ? $client->string('PLUGIN_PYRRHA_I_LIKE')
+                              : $client->string('PLUGIN_PYRRHA_I_DONT_LIKE'),
+      showBriefly => 1,
+      nowPlaying  => 1,
+    }] });
+
+  })->catch(sub {
+    my $error = shift;
+    $log->error('_rateFromMenu: unable to add feedback: ' . $error);
+    $callback->({ items => [{ name => $error, showBriefly => 1 }] });
+  });
+}
 
 1;
-
